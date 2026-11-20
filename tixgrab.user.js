@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         TixGrab
 // @namespace    https://by-jass.tixgrab
-// @version      1.1.0
-// @description  tixgrab by jass: hold shift and click one seat, it picks every connected seat one by one and hits reserve
+// @version      1.2.0
+// @description  tixgrab by jass: hold shift and click one seat, it picks every connected seat at once and hits reserve
 // @author       Jass
 // @match        https://*.ticketmaster.com/*
 // @match        https://*.ticketmaster.ca/*
@@ -271,7 +271,7 @@
     if (!st.sound) return;
     primeAudio();
     if (!audio) return;
-    const now = audio.currentTime, at = Math.max(now, lastSeatAt + 0.055);
+    const now = audio.currentTime, at = Math.max(now, lastSeatAt + 0.045);
     lastSeatAt = at;
     tick(at - now, TICK.seat);
   }
@@ -401,10 +401,18 @@
     return null;
   }
 
-  function scanSeats(R, S) {
+  function scanRoot(seedEl, R) {
+    if (seedEl.getRootNode() !== document) return document;
+    for (let p = seedEl.parentElement; p && p !== document.body && p !== document.documentElement; p = p.parentElement) {
+      const r = p.getBoundingClientRect();
+      if (r.left <= R.l && r.top <= R.t && r.right >= R.r && r.bottom >= R.b) return p;
+    }
+    return document;
+  }
+  function scanSeats(R, S, root) {
     const lo = S * 0.5, hi = S * 1.7;
     const near = [], all = new Set(), strong = new Set();
-    for (const el of walk(document)) {
+    for (const el of walk(root || document)) {
       if (el.hasAttribute('data-tixgrab')) continue;
       const rc = el.getBoundingClientRect();
       if (rc.width < lo || rc.height < lo || rc.width > hi || rc.height > hi) continue;
@@ -599,6 +607,25 @@
     }
   }
 
+  async function verifySeats(T, my) {
+    const t0 = performance.now();
+    let tries = 0, i = 0, nextAt = t0 + 70;
+    for (;;) {
+      if (my !== epoch) return;
+      const lost = T.filter((t) => !picked(t));
+      if (!lost.length) return;
+      if (cutWait) return;
+      const now = performance.now();
+      if (now - t0 >= 700) { log({ selected: 'missed', n: lost.length }); return; }
+      if (tries < 3 && now >= nextAt) {
+        tries++; nextAt = now + 110;
+        lost.forEach((t) => { t.again = true; fireTarget(t); });
+        log({ selected: 'retry', n: lost.length });
+      }
+      if (++i < 40) await yieldNow(); else await sleep(3);
+    }
+  }
+
   const RES_EXACT = /^(reserve( now)?|reserve (seats?|tickets?)|reserve selected( seats?| tickets?)?)$/i;
   function findReserve() {
     let best = null, bs = 0;
@@ -640,9 +667,15 @@
     stage = 'select'; cutWait = false; orphanTries = 0; ctx = null;
     watchDialogs();
     const rc0 = seedEl.getBoundingClientRect(), S = Math.max(rc0.width, rc0.height), Rg = Math.max(90, S * 16);
+    const region = { l: x - Rg, t: y - Rg, r: x + Rg, b: y + Rg };
+    const root = scanRoot(seedEl, region);
     let items = [];
-    try { items = scanSeats({ l: x - Rg, t: y - Rg, r: x + Rg, b: y + Rg }, S); } catch (_) {}
-    const seed = nearestSeed(items, x, y, S);
+    try { items = scanSeats(region, S, root); } catch (_) {}
+    let seed = nearestSeed(items, x, y, S);
+    if (!seed && root !== document) {
+      try { items = scanSeats(region, S, document); } catch (_) {}
+      seed = nearestSeed(items, x, y, S);
+    }
     if (!seed) { stage = 'idle'; log({ pack: 0, why: 'no seat found under the click' }); return; }
     for (const it of items) if (it.cand && it !== seed && !sameKind(it.color, seed.color)) it.cand = false;
     let chain = [];
@@ -653,13 +686,9 @@
     const all = chain.map(makeTarget), T = all.slice(a, b);
     ctx = { all, a, b, T };
     log({ pack: chain.length, pick: T.length, want: st.qty, scan: Math.round(performance.now() - t0) });
-    let got = 0;
-    for (const t of T) {
-      if (my !== epoch) return;
-      if (cutWait) break;
-      if (await pickOne(t, my)) { got++; log({ selected: got, of: T.length, ms: Math.round(performance.now() - t0) }); }
-      else if (my === epoch) log({ selected: 'missed', n: got + 1 });
-    }
+    T.forEach((t) => { fireTarget(t); seatTick(); });
+    log({ selected: T.length, ms: Math.round(performance.now() - t0) });
+    await verifySeats(T, my);
     if (my !== epoch) return;
     let live = T.filter(picked);
     if (!live.length) { stage = 'idle'; log({ reserve: 'skipped', why: 'no seat registered' }); return; }
@@ -765,6 +794,9 @@
   }
   function handleDialogs() {
     if (!engineOn() || !st.popups || performance.now() > watchUntil) return;
+    const nowD = performance.now();
+    if (nowD - lastDlg < 30) return;
+    lastDlg = nowD;
     for (const d of findDialogs()) {
       if (panelLike(d)) continue;
       const isErr = ERR.test(d.text), n = parseLimit(d.text);
@@ -782,7 +814,7 @@
       return;
     }
   }
-  let dmo = null, dTimer = null, watchUntil = 0;
+  let dmo = null, dTimer = null, watchUntil = 0, lastDlg = 0;
   function watchDialogs() {
     watchUntil = performance.now() + 10000;
     if (!dmo) { dmo = new MutationObserver(handleDialogs); dmo.observe(document.documentElement, { subtree: true, childList: true, attributes: true }); }
